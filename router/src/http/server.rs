@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 use std::str;
 
 async fn json_transform_middleware<B>(
-    req: Request<B>,
+    req: Request<Body>,
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode>
 where
@@ -145,8 +145,9 @@ where
                 .into_iter()
                 .zip(prediction_ids.into_iter())
                 .map(|(prediction, id)| {
+                    let id_str = id.as_ref();
                     json!({
-                        id.as_ref().map(|s| s.as_str()).unwrap_or("0"): {
+                        id_str.as_ref().map(|s| s.as_str()).unwrap_or("0"): {
                             "vectors": prediction
                         }
                     })
