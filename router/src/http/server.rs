@@ -40,6 +40,123 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::instrument;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+use axum::{
+    body::Body,
+    http::{Request, Response, StatusCode},
+    middleware::Next,
+    response::IntoResponse,
+};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::str;
+
+async fn json_transform_middleware<B>(
+    req: Request<B>,
+    next: Next<B>,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    B: Send + 'static,
+{
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let (parts, body) = req.into_parts();
+    let bytes = hyper::body::to_bytes(body).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let (prediction_ids, inputs): (Vec<_>, Vec<_>) = match content_type {
+        "application/json" => {
+            let parsed_data: BTreeMap<String, Value> = serde_json::from_str(raw_data)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+            if let Some(first_value) = parsed_data.values().next() {
+                if first_value.is_object() {
+                    let ids = parsed_data.keys().cloned().collect();
+                    let inputs = parsed_data.values().map(|v| v["inputs"].clone()).collect();
+                    (ids, inputs)
+                } else {
+                    let id = parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0").to_string();
+                    let meta = parsed_data.get("meta").cloned();
+                    let inputs = vec![parsed_data.get("inputs").cloned().unwrap_or_default()];
+                    (vec![json!({"id": id, "meta": meta})], inputs)
+                }
+            } else {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+        "application/jsonlines" => {
+            let lines: Vec<&str> = raw_data.lines().collect();
+            let payloads: Vec<BTreeMap<String, Value>> = lines
+                .iter()
+                .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
+                .collect::<Result<_, _>>()?;
+
+            let ids = payloads
+                .iter()
+                .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}))
+                .collect();
+            let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
+            (ids, inputs)
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
+    let mut response = next.run(new_req).await;
+
+    let response_content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if response_content_type == "application/json" || response_content_type == "application/jsonlines" {
+        let (parts, body) = response.into_parts();
+        let bytes = hyper::body::to_bytes(body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let predictions: Vec<Value> = serde_json::from_str(response_content)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let body = if content_type == "application/jsonlines" {
+            let body = predictions
+                .into_iter()
+                .zip(prediction_ids.into_iter())
+                .map(|(prediction, id)| {
+                    json!({
+                        "id": id["id"],
+                        "meta": id["meta"],
+                        "vectors": prediction
+                    })
+                })
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Response::from_parts(parts, Body::from(body))
+        } else {
+            let body = predictions
+                .into_iter()
+                .zip(prediction_ids.into_iter())
+                .map(|(prediction, id)| {
+                    json!({
+                        id.as_str().unwrap_or("0"): {
+                            "vectors": prediction
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            Response::from_parts(parts, Body::from(serde_json::to_string(&body).unwrap()))
+        };
+
+        Ok(body)
+    } else {
+        Ok(response)
+    }
+}
 
 ///Text Embeddings Inference endpoint info
 #[utoipa::path(
@@ -1802,7 +1919,8 @@ pub async fn run(
         .layer(Extension(prom_handle.clone()))
         .layer(OtelAxumLayer::default())
         .layer(DefaultBodyLimit::max(payload_limit))
-        .layer(cors_layer);
+        .layer(cors_layer)
+        .layer(from_fn(json_transform_middleware));
 
     // Run server
     let listener = tokio::net::TcpListener::bind(&addr)
