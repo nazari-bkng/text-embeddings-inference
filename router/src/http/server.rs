@@ -49,13 +49,12 @@ use axum::{
 use axum::body;
 use axum::middleware::from_fn;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::collections::BTreeMap;
 use std::str;
 
 async fn json_transform_middleware<B>(
     req: Request<B>,
-    next: Next<B>,
+    next: Next,
 ) -> Result<impl IntoResponse, StatusCode>
 where
     B: Send + 'static,
