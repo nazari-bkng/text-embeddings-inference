@@ -131,7 +131,7 @@ where
                 .map(|(prediction, id)| {
                     let id_value: Value = serde_json::from_str(&id).unwrap_or(Value::Null);
                     json!({
-                        "id": id_value["id"].clone(),,
+                        "id": id_value["id"].clone(),
                         "meta": id_value["meta"].clone(),
                         "vectors": prediction
                     })
