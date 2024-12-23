@@ -42,10 +42,12 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use axum::{
     body::Body,
-    http::{Request, Response, StatusCode},
+    http::{Request, Response},
     middleware::Next,
     response::IntoResponse,
 };
+use axum::body;
+use axum::middleware::from_fn;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::BTreeMap;
@@ -65,7 +67,7 @@ where
         .unwrap_or("");
 
     let (parts, body) = req.into_parts();
-    let bytes = hyper::body::to_bytes(body).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bytes = body::to_bytes(body).await.map_err(|_| StatusCode::BAD_REQUEST)?;
     let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let (prediction_ids, inputs): (Vec<_>, Vec<_>) = match content_type {
