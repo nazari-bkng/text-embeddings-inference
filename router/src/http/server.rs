@@ -66,7 +66,7 @@ where
         .unwrap_or("");
 
     let (parts, body) = req.into_parts();
-    let bytes = body::to_bytes(body).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let bytes = body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::BAD_REQUEST)?;
     let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let (prediction_ids, inputs): (Vec<_>, Vec<_>) = match content_type {
@@ -83,7 +83,7 @@ where
                     let id = parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0").to_string();
                     let meta = parsed_data.get("meta").cloned();
                     let inputs = vec![parsed_data.get("inputs").cloned().unwrap_or_default()];
-                    (vec![json!({"id": id, "meta": meta})], inputs)
+                    (vec![json!({"id": id, "meta": meta}).to_string()], inputs)
                 }
             } else {
                 return Err(StatusCode::BAD_REQUEST);
@@ -96,9 +96,9 @@ where
                 .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
                 .collect::<Result<_, _>>()?;
 
-            let ids = payloads
+            let ids: Vec<String> = payloads
                 .iter()
-                .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}))
+                .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}).to_string())
                 .collect();
             let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
             (ids, inputs)
@@ -117,20 +117,22 @@ where
 
     if response_content_type == "application/json" || response_content_type == "application/jsonlines" {
         let (parts, body) = response.into_parts();
-        let bytes = body::to_bytes(body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let bytes = body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let predictions: Vec<Value> = serde_json::from_str(response_content)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let body = if content_type == "application/jsonlines" {
+
             let body = predictions
                 .into_iter()
                 .zip(prediction_ids.into_iter())
                 .map(|(prediction, id)| {
+                    let id_value: Value = serde_json::from_str(&id).unwrap_or(Value::Null);
                     json!({
-                        "id": id["id"],
-                        "meta": id["meta"],
+                        "id": id_value["id"].clone(),,
+                        "meta": id_value["meta"].clone(),
                         "vectors": prediction
                     })
                 })
@@ -144,7 +146,7 @@ where
                 .zip(prediction_ids.into_iter())
                 .map(|(prediction, id)| {
                     json!({
-                        id.as_str().unwrap_or("0"): {
+                        id.as_ref().map(|s| s.as_str()).unwrap_or("0"): {
                             "vectors": prediction
                         }
                     })
