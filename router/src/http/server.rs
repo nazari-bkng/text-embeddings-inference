@@ -18,7 +18,14 @@ use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Extension};
 use axum::http::HeaderValue;
 use axum::http::{Method, StatusCode};
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
+use axum::{
+    body::Body,
+    http::{Request, Response},
+    middleware::Next,
+    response::IntoResponse,
+};
 use axum::{http, Json, Router};
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
 use base64::prelude::BASE64_STANDARD;
@@ -27,8 +34,11 @@ use futures::future::join_all;
 use futures::FutureExt;
 use http::header::AUTHORIZATION;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use serde_json::{json, Value};
 use simsimd::SpatialSimilarity;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::str;
 use std::time::{Duration, Instant};
 use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
@@ -40,6 +50,132 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::instrument;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+async fn json_transform_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let should_transform = req.uri().path() == "/embed" || req.uri().path() == "/invocations";
+    if !should_transform {
+        return Ok(next.run(req).await);
+    }
+    let should_log = std::env::var("CUSTOM_DEBUG_LOG").is_ok();
+    // Extract the content type before moving `req`
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Now it's safe to move `req`
+    let (mut parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if should_log {
+        tracing::info!("Raw request body: {}", raw_data);
+    }
+
+    let (prediction_ids, inputs) = if content_type == "application/json" {
+        let parsed_data: BTreeMap<String, Value> =
+            serde_json::from_str(raw_data).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let inputs = parsed_data.get("inputs").cloned().unwrap_or_default();
+        let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned(), "inputs": inputs.clone()});
+        (vec![prediction_ids], inputs)
+    } else if content_type == "application/jsonlines" {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let lines: Vec<&str> = raw_data.lines().collect();
+        let payloads: Vec<BTreeMap<String, Value>> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
+            .collect::<Result<_, _>>()?;
+        let prediction_ids = payloads
+            .iter()
+            .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned(), "inputs": ent.get("inputs").clone()}))
+            .collect();
+        let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
+        (prediction_ids, inputs)
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    if should_log {
+        tracing::info!("Request JSON: {}", json!({"inputs": inputs}).to_string());
+    }
+
+    let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
+    let mut response = next.run(new_req).await;
+
+    if response.status() != StatusCode::OK {
+        let error_message = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let error_response = Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(error_message))
+            .unwrap();
+        return Ok(error_response);
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if should_log {
+        tracing::info!("Response JSON: {}", response_content);
+    }
+
+    let predictions: Vec<Value> =
+        serde_json::from_str(response_content).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let body = if content_type == "application/jsonlines" {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jsonlines"),
+        );
+        predictions
+            .into_iter()
+            .zip(prediction_ids.into_iter())
+            .map(|(prediction, id)| {
+                json!([{
+                    "id": id["id"].clone(),
+                    "meta": id["meta"].clone(),
+                    "inputs": id["inputs"].clone(),
+                    "vectors": prediction
+                }])
+            })
+            .map(|v| serde_json::to_string(&v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        predictions
+            .into_iter()
+            .zip(prediction_ids.into_iter())
+            .map(|(prediction, id)| {
+                json!([{
+                    "id": id["id"].clone(),
+                    "meta": id["meta"].clone(),
+                    "inputs": id["inputs"].clone(),
+                    "vectors": prediction
+                }])
+            })
+            .map(|v| serde_json::to_string(&v).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Ok(Response::from_parts(parts, Body::from(body)))
+}
 
 ///Text Embeddings Inference endpoint info
 #[utoipa::path(
@@ -1802,7 +1938,8 @@ pub async fn run(
         .layer(Extension(prom_handle.clone()))
         .layer(OtelAxumLayer::default())
         .layer(DefaultBodyLimit::max(payload_limit))
-        .layer(cors_layer);
+        .layer(cors_layer)
+        .layer(from_fn(json_transform_middleware));
 
     // Run server
     let listener = tokio::net::TcpListener::bind(&addr)
