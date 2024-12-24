@@ -55,6 +55,10 @@ async fn json_transform_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
+    let should_transform = req.uri().path() == "/embed" || req.uri().path() == "/invocations";
+    if !should_transform {
+        return Ok(next.run(req).await);
+    }
     let should_log = std::env::var("CUSTOM_DEBUG_LOG").is_ok();
     // Extract the content type before moving `req`
     let content_type = req
