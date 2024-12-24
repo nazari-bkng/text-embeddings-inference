@@ -18,7 +18,14 @@ use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Extension};
 use axum::http::HeaderValue;
 use axum::http::{Method, StatusCode};
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
+use axum::{
+    body::Body,
+    http::{Request, Response},
+    middleware::Next,
+    response::IntoResponse,
+};
 use axum::{http, Json, Router};
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
 use base64::prelude::BASE64_STANDARD;
@@ -27,8 +34,11 @@ use futures::future::join_all;
 use futures::FutureExt;
 use http::header::AUTHORIZATION;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use serde_json::{json, Value};
 use simsimd::SpatialSimilarity;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::str;
 use std::time::{Duration, Instant};
 use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
@@ -40,17 +50,6 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::instrument;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use axum::{
-    body::Body,
-    http::{Request, Response},
-    middleware::Next,
-    response::IntoResponse,
-};
-use axum::middleware::from_fn;
-use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::str;
-
 
 async fn json_transform_middleware(
     req: Request<Body>,
@@ -61,36 +60,44 @@ async fn json_transform_middleware(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
     // Now it's safe to move `req`
-    let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (mut parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    tracing::info!("Raw request body: {}", raw_data);
 
-    let (prediction_ids, inputs) = match content_type {
-        "application/json" => {
-            let parsed_data: BTreeMap<String, Value> = serde_json::from_str(raw_data)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned()});
-            let inputs = vec![parsed_data.get("inputs").cloned().unwrap_or_default()];
-            (vec![prediction_ids], inputs)
-        }
-        "application/jsonlines" => {
-            let lines: Vec<&str> = raw_data.lines().collect();
-            let payloads: Vec<BTreeMap<String, Value>> = lines
-                .iter()
-                .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
-                .collect::<Result<_, _>>()?;
-            let prediction_ids = payloads
-                .iter()
-                .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}))
-                .collect();
-            let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
-            (prediction_ids, inputs)
-        }
-        _ => return Err(StatusCode::BAD_REQUEST),
+    let (prediction_ids, inputs) = if content_type == "application/json" {
+        let parsed_data: BTreeMap<String, Value> =
+            serde_json::from_str(raw_data).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let inputs = parsed_data.get("inputs").cloned().unwrap_or_default();
+        let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned(), "inputs": inputs.clone()});
+        (vec![prediction_ids], inputs)
+    } else if content_type == "application/jsonlines" {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let lines: Vec<&str> = raw_data.lines().collect();
+        let payloads: Vec<BTreeMap<String, Value>> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
+            .collect::<Result<_, _>>()?;
+        let prediction_ids = payloads
+            .iter()
+            .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned(), "inputs": ent.get("inputs").clone()}))
+            .collect();
+        let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
+        (prediction_ids, inputs)
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
     };
+
+    tracing::info!("Request JSON: {}", json!({"inputs": inputs}).to_string());
 
     let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
     let mut response = next.run(new_req).await;
@@ -106,14 +113,21 @@ async fn json_transform_middleware(
         return Ok(error_response);
     }
 
-    let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let predictions: Vec<Value> = serde_json::from_str(response_content)
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tracing::info!("Response JSON: {}", response_content);
+
+    let predictions: Vec<Value> =
+        serde_json::from_str(response_content).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let body = if content_type == "application/jsonlines" {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/jsonlines"),
+        );
         predictions
             .into_iter()
             .zip(prediction_ids.into_iter())
@@ -121,6 +135,7 @@ async fn json_transform_middleware(
                 json!({
                     "id": id["id"].clone(),
                     "meta": id["meta"].clone(),
+                    "inputs": id["inputs"].clone(),
                     "vectors": prediction
                 })
             })
@@ -128,14 +143,19 @@ async fn json_transform_middleware(
             .collect::<Vec<_>>()
             .join("\n")
     } else {
+        parts.headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         predictions
             .into_iter()
             .zip(prediction_ids.into_iter())
             .map(|(prediction, id)| {
                 json!({
-                    id.as_str().unwrap_or("0"): {
-                        "vectors": prediction
-                    }
+                    "id": id["id"].clone(),
+                    "meta": id["meta"].clone(),
+                    "inputs": id["inputs"].clone(),
+                    "vectors": prediction
                 })
             })
             .map(|v| serde_json::to_string(&v).unwrap())
