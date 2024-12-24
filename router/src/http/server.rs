@@ -54,7 +54,7 @@ use std::str;
 
 async fn json_transform_middleware(
     req: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response<Body>, StatusCode> {
     // Extract the content type before moving `req`
     let content_type = req
