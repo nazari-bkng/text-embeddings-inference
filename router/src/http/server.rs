@@ -55,6 +55,7 @@ async fn json_transform_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
+    let should_log = std::env::var("CUSTOM_DEBUG_LOG").is_ok();
     // Extract the content type before moving `req`
     let content_type = req
         .headers()
@@ -69,7 +70,9 @@ async fn json_transform_middleware(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    tracing::info!("Raw request body: {}", raw_data);
+    if should_log {
+        tracing::info!("Raw request body: {}", raw_data);
+    }
 
     let (prediction_ids, inputs) = if content_type == "application/json" {
         let parsed_data: BTreeMap<String, Value> =
@@ -97,7 +100,9 @@ async fn json_transform_middleware(
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    tracing::info!("Request JSON: {}", json!({"inputs": inputs}).to_string());
+    if should_log {
+        tracing::info!("Request JSON: {}", json!({"inputs": inputs}).to_string());
+    }
 
     let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
     let mut response = next.run(new_req).await;
@@ -118,7 +123,9 @@ async fn json_transform_middleware(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tracing::info!("Response JSON: {}", response_content);
+    if should_log {
+        tracing::info!("Response JSON: {}", response_content);
+    }
 
     let predictions: Vec<Value> =
         serde_json::from_str(response_content).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
