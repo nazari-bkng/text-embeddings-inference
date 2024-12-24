@@ -99,7 +99,7 @@ async fn json_transform_middleware(
             let error_message = axum::body::to_bytes(response.into_body(), 1024 * 1024)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response());
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         let (parts, body) = response.into_parts();
