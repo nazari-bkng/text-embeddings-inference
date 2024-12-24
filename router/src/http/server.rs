@@ -51,96 +51,99 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::str;
 
+
 async fn json_transform_middleware(
     req: Request<Body>,
-    next: Next,
+    next: Next<Body>,
 ) -> Result<impl IntoResponse, StatusCode> {
-  if req.uri().path() == "/invocations" {
-    let content_type = req
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    // Check if the request URI is /embed
+    if req.uri().path() == "/embed" {
+        let content_type = req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
 
-    let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body).await.map_err(|_| StatusCode::BAD_REQUEST)?;
-    let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let (parts, body) = req.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+        let raw_data = str::from_utf8(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let (prediction_ids, inputs) = match content_type {
-        "application/json" => {
-            let parsed_data: BTreeMap<String, Value> = serde_json::from_str(raw_data)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned()});
-            let inputs = vec![parsed_data.get("inputs").cloned().unwrap_or_default()];
-            (vec![prediction_ids], inputs)
+        let (prediction_ids, inputs) = match content_type {
+            "application/json" => {
+                let parsed_data: BTreeMap<String, Value> = serde_json::from_str(raw_data)
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned()});
+                let inputs = vec![parsed_data.get("inputs").cloned().unwrap_or_default()];
+                (vec![prediction_ids], inputs)
+            }
+            "application/jsonlines" => {
+                let lines: Vec<&str> = raw_data.lines().collect();
+                let payloads: Vec<BTreeMap<String, Value>> = lines
+                    .iter()
+                    .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
+                    .collect::<Result<_, _>>()?;
+                let prediction_ids = payloads
+                    .iter()
+                    .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}))
+                    .collect();
+                let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
+                (prediction_ids, inputs)
+            }
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
+
+        let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
+        let mut response = next.run(new_req).await;
+
+        if response.status() != StatusCode::OK {
+            let error_message = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response());
         }
-        "application/jsonlines" => {
-            let lines: Vec<&str> = raw_data.lines().collect();
-            let payloads: Vec<BTreeMap<String, Value>> = lines
-                .iter()
-                .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
-                .collect::<Result<_, _>>()?;
-            let prediction_ids = payloads
-                .iter()
-                .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned()}))
-                .collect();
-            let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
-            (prediction_ids, inputs)
-        }
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
 
-    let new_req = Request::from_parts(parts, Body::from(json!({"inputs": inputs}).to_string()));
-    let mut response = next.run(new_req).await;
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if response.status() != StatusCode::OK {
-        let error_message = axum::body::to_bytes(response.into_body())
-            .await
+        let predictions: Vec<Value> = serde_json::from_str(response_content)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response());
-    }
 
-    let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let response_content = str::from_utf8(&bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let predictions: Vec<Value> = serde_json::from_str(response_content)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let body = if content_type == "application/jsonlines" {
-        predictions
-            .into_iter()
-            .zip(prediction_ids.into_iter())
-            .map(|(prediction, id)| {
-                json!({
-                    "id": id["id"].clone(),
-                    "meta": id["meta"].clone(),
-                    "vectors": prediction
-                })
-            })
-            .map(|v| serde_json::to_string(&v).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        predictions
-            .into_iter()
-            .zip(prediction_ids.into_iter())
-            .map(|(prediction, id)| {
-                json!({
-                    id.as_str().unwrap_or("0"): {
+        let body = if content_type == "application/jsonlines" {
+            predictions
+                .into_iter()
+                .zip(prediction_ids.into_iter())
+                .map(|(prediction, id)| {
+                    json!({
+                        "id": id["id"].clone(),
+                        "meta": id["meta"].clone(),
                         "vectors": prediction
-                    }
+                    })
                 })
-            })
-            .map(|v| serde_json::to_string(&v).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            predictions
+                .into_iter()
+                .zip(prediction_ids.into_iter())
+                .map(|(prediction, id)| {
+                    json!({
+                        id.as_str().unwrap_or("0"): {
+                            "vectors": prediction
+                        }
+                    })
+                })
+                .map(|v| serde_json::to_string(&v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
-    Ok(Response::from_parts(parts, Body::from(body)))
-  } else {
-    Ok(next.run(req).await)
-  }
+        Ok(Response::from_parts(parts, Body::from(body)))
+    } else {
+        // If the URI is not /embed, just pass the request through
+        Ok(next.run(req).await)
+    }
 }
 
 ///Text Embeddings Inference endpoint info
