@@ -46,7 +46,6 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
-use axum::body;
 use axum::middleware::from_fn;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -54,7 +53,7 @@ use std::str;
 
 async fn json_transform_middleware(
     req: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
   if req.uri().path() == "/invocations" {
     let content_type = req
