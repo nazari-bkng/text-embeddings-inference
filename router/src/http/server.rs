@@ -54,7 +54,7 @@ use std::str;
 
 async fn json_transform_middleware(
     req: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Check if the request URI is /embed
     if req.uri().path() == "/embed" {
