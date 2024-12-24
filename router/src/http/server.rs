@@ -143,12 +143,12 @@ async fn json_transform_middleware(
             .into_iter()
             .zip(prediction_ids.into_iter())
             .map(|(prediction, id)| {
-                json!({
+                json!([{
                     "id": id["id"].clone(),
                     "meta": id["meta"].clone(),
                     "inputs": id["inputs"].clone(),
                     "vectors": prediction
-                })
+                }])
             })
             .map(|v| serde_json::to_string(&v).unwrap())
             .collect::<Vec<_>>()
@@ -162,12 +162,12 @@ async fn json_transform_middleware(
             .into_iter()
             .zip(prediction_ids.into_iter())
             .map(|(prediction, id)| {
-                json!({
+                json!([{
                     "id": id["id"].clone(),
                     "meta": id["meta"].clone(),
                     "inputs": id["inputs"].clone(),
                     "vectors": prediction
-                })
+                }])
             })
             .map(|v| serde_json::to_string(&v).unwrap())
             .collect::<Vec<_>>()
