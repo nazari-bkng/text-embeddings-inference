@@ -60,7 +60,7 @@ async fn json_transform_middleware(
         return Ok(next.run(req).await);
     }
     let should_log = std::env::var("CUSTOM_DEBUG_LOG").is_ok();
-    // Extract the content type before moving `req`
+
     let content_type = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -68,7 +68,6 @@ async fn json_transform_middleware(
         .unwrap_or("")
         .to_string();
 
-    // Now it's safe to move `req`
     let (mut parts, body) = req.into_parts();
     let bytes = axum::body::to_bytes(body, 1024 * 1024)
         .await
@@ -79,10 +78,16 @@ async fn json_transform_middleware(
     }
 
     let (prediction_ids, inputs) = if content_type == "application/json" {
-        let parsed_data: BTreeMap<String, Value> =
+        let mut parsed_data: BTreeMap<String, Value> =
             serde_json::from_str(raw_data).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        // Add truncate:true if not specified
+        if !parsed_data.contains_key("truncate") {
+            parsed_data.insert("truncate".to_string(), json!(true));
+        }
+
         let inputs = parsed_data.get("inputs").cloned().unwrap_or_default();
-        let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned(), "inputs": inputs.clone()});
+        let prediction_ids = json!({"id": parsed_data.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": parsed_data.get("meta").cloned(), "inputs": inputs.clone(), "truncate": parsed_data.get("truncate").cloned()});
         (vec![prediction_ids], inputs)
     } else if content_type == "application/jsonlines" {
         parts.headers.insert(
@@ -92,11 +97,19 @@ async fn json_transform_middleware(
         let lines: Vec<&str> = raw_data.lines().collect();
         let payloads: Vec<BTreeMap<String, Value>> = lines
             .iter()
-            .map(|line| serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST))
-            .collect::<Result<_, _>>()?;
+            .map(|line| {
+                let mut payload: BTreeMap<String, Value> = serde_json::from_str(line).map_err(|_| StatusCode::BAD_REQUEST)?;
+                // Add truncate:true if not specified
+                if !payload.contains_key("truncate") {
+                    payload.insert("truncate".to_string(), json!(true));
+                }
+                Ok(payload)
+            })
+            .collect::<Result<_, StatusCode>>()?;
+
         let prediction_ids = payloads
             .iter()
-            .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned(), "inputs": ent.get("inputs").clone()}))
+            .map(|ent| json!({"id": ent.get("id").and_then(|v| v.as_str()).unwrap_or("0"), "meta": ent.get("meta").cloned(), "inputs": ent.get("inputs").clone(), "truncate": ent.get("truncate").cloned()}))
             .collect();
         let inputs = payloads.iter().map(|ent| ent["inputs"].clone()).collect();
         (prediction_ids, inputs)
