@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM lukemathwalker/cargo-chef:latest-rust-1.85-bookworm AS chef
 WORKDIR /usr/src
 
