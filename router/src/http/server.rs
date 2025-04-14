@@ -44,6 +44,7 @@ use text_embeddings_backend::BackendError;
 use text_embeddings_core::infer::{
     AllEmbeddingsInferResponse, Infer, InferMetadata, PooledEmbeddingsInferResponse,
 };
+use text_embeddings_core::tokenization::{into_tokens, SimpleToken as CoreSimpleToken};
 use text_embeddings_core::TextEmbeddingsError;
 use tokio::sync::OwnedSemaphorePermit;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -730,8 +731,7 @@ async fn embed(
 
     let (response, metadata) = match req.inputs {
         Input::Single(input) => {
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_count", "method" => "single").increment(1);
 
             let compute_chars = input.count_chars();
 
@@ -748,8 +748,7 @@ async fn embed(
                 .await
                 .map_err(ErrorResponse::from)?;
 
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_success", "method" => "single").increment(1);
 
             (
                 EmbedResponse(vec![response.results]),
@@ -910,8 +909,7 @@ async fn embed_sparse(
 
     let (response, metadata) = match req.inputs {
         Input::Single(input) => {
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_count", "method" => "single").increment(1);
 
             let compute_chars = input.count_chars();
 
@@ -927,8 +925,7 @@ async fn embed_sparse(
                 .await
                 .map_err(ErrorResponse::from)?;
 
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_success", "method" => "single").increment(1);
 
             (
                 EmbedSparseResponse(vec![sparsify(response.results)]),
@@ -1081,8 +1078,7 @@ async fn embed_all(
 
     let (response, metadata) = match req.inputs {
         Input::Single(input) => {
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_count", "method" => "single").increment(1);
 
             let compute_chars = input.count_chars();
 
@@ -1098,8 +1094,7 @@ async fn embed_all(
                 .await
                 .map_err(ErrorResponse::from)?;
 
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_success", "method" => "single").increment(1);
 
             (
                 EmbedAllResponse(vec![response.results]),
@@ -1266,8 +1261,7 @@ async fn openai_embed(
 
     let (embeddings, metadata) = match req.input {
         Input::Single(input) => {
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_count", "method" => "single").increment(1);
 
             let compute_chars = input.count_chars();
 
@@ -1284,8 +1278,7 @@ async fn openai_embed(
                 .await
                 .map_err(ErrorResponse::from)?;
 
-            let counter = metrics::counter!("te_request_count", "method" => "single");
-            counter.increment(1);
+            metrics::counter!("te_request_success", "method" => "single").increment(1);
 
             let embedding = encode_embedding(response.results);
             (
@@ -1452,32 +1445,22 @@ async fn tokenize(
             .map_err(ErrorResponse::from)?;
         let input = encoded_input.unwrap_or(input);
 
-        let tokens: Vec<SimpleToken> = encoding
-            .get_ids()
-            .iter()
-            .zip(encoding.get_offsets())
-            .zip(encoding.get_special_tokens_mask())
-            .zip(encoding.get_tokens())
-            .map(|(((&id, &(start, stop)), special), token)| {
-                let special = *special == 1;
-                match special {
-                    true => SimpleToken {
-                        id,
-                        text: token.clone(),
-                        special,
-                        start: None,
-                        stop: None,
-                    },
-                    false => {
-                        let text: String = input.chars().skip(start).take(stop - start).collect();
-                        SimpleToken {
-                            id,
-                            text,
-                            special,
-                            start: Some(start),
-                            stop: Some(stop),
-                        }
-                    }
+        let tokens: Vec<SimpleToken> = into_tokens(encoding, &input)
+            .into_iter()
+            .map(|t| {
+                let CoreSimpleToken {
+                    id,
+                    text,
+                    special,
+                    start,
+                    stop,
+                } = t;
+                SimpleToken {
+                    id,
+                    text,
+                    special,
+                    start,
+                    stop,
                 }
             })
             .collect();

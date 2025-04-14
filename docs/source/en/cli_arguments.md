@@ -131,10 +131,10 @@ Options:
 
           [env: DEFAULT_PROMPT=]
 
-      --hf-api-token <HF_API_TOKEN>
-          Your HuggingFace hub token
+      --hf-token <HF_TOKEN>
+          Your Hugging Face Hub token
 
-          [env: HF_API_TOKEN=]
+          [env: HF_TOKEN=]
 
       --hostname <HOSTNAME>
           The IP address to listen on
@@ -142,7 +142,7 @@ Options:
           [env: HOSTNAME=]
           [default: 0.0.0.0]
 
-  -p, --port <PORT>
+      -p, --port <PORT>
           The port to listen on
 
           [env: PORT=]
@@ -181,6 +181,11 @@ Options:
           Outputs the logs in JSON format (useful for telemetry)
 
           [env: JSON_OUTPUT=]
+
+      --disable-spans
+          Disables the span logging trace
+
+          [env: DISABLE_SPANS=]
 
       --otlp-endpoint <OTLP_ENDPOINT>
           The grpc endpoint for opentelemetry. Telemetry is sent to this endpoint as OTLP over gRPC. e.g. `http://localhost:4317`

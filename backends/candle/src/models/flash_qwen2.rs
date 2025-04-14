@@ -22,7 +22,7 @@ struct Qwen2Attention {
 impl Qwen2Attention {
     pub fn load(vb: VarBuilder, config: &Qwen2Config) -> Result<Self> {
         if config.use_sliding_window {
-            candle::bail!("Sliding window is not supported");
+            candle::bail!("Sliding window is not supported for Qwen2",);
         }
 
         let num_attention_heads = config.num_attention_heads;
@@ -112,6 +112,7 @@ impl Qwen2Attention {
             max_s,
             self.softmax_scale,
             false,
+            None,
             None,
         )?;
         let attention = attention.flatten_from(candle::D::Minus2)?;
@@ -264,7 +265,15 @@ impl FlashQwen2Model {
             ModelType::Embedding(pool) => pool,
         };
 
-        let vb = vb.pp("model");
+        // Pushing the prefix for `model` is apparently only required if the model architecture is
+        // ForCausalLM as it contains the `lm_head`, other than that, the `model` key won't be
+        // present e.g. a model without the `model` key as it's a `Qwen2Model` instance not a
+        // `Qwen2ModelForCausalLM` is https://huggingface.co/mims-harvard/ToolRAG-T1-GTE-Qwen2-1.5B
+        let vb = if vb.contains_tensor("model.embed_tokens.weight") {
+            vb.pp("model")
+        } else {
+            vb
+        };
 
         let embeddings = Embedding::new(
             vb.pp("embed_tokens")

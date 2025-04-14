@@ -1,4 +1,4 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1.75-bookworm AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.85-bookworm AS chef
 WORKDIR /usr/src
 
 ENV SCCACHE=0.5.4
@@ -10,6 +10,7 @@ RUN curl -fsSL https://github.com/mozilla/sccache/releases/download/v$SCCACHE/sc
 
 FROM chef AS planner
 
+COPY candle-extensions candle-extensions
 COPY backends backends
 COPY core core
 COPY router router
@@ -24,8 +25,6 @@ ARG GIT_SHA
 ARG DOCKER_LABEL
 
 # sccache specific variables
-ARG ACTIONS_CACHE_URL
-ARG ACTIONS_RUNTIME_TOKEN
 ARG SCCACHE_GHA_ENABLED
 
 RUN wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
@@ -43,7 +42,9 @@ RUN echo "int mkl_serv_intel_cpu_true() {return 1;}" > fakeintel.c && \
 
 COPY --from=planner /usr/src/recipe.json recipe.json
 
-RUN cargo chef cook --release --features ort --features candle --features mkl-dynamic --no-default-features --recipe-path recipe.json && sccache -s
+RUN --mount=type=secret,id=actions_cache_url,env=ACTIONS_CACHE_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+     cargo chef cook --release --features ort,candle,mkl --no-default-features --recipe-path recipe.json && sccache -s
 
 COPY backends backends
 COPY core core
@@ -53,7 +54,9 @@ COPY Cargo.lock ./
 
 FROM builder AS http-builder
 
-RUN cargo build --release --bin text-embeddings-router -F ort -F candle -F mkl-dynamic -F http --no-default-features && sccache -s
+RUN --mount=type=secret,id=actions_cache_url,env=ACTIONS_CACHE_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+    cargo build --release --bin text-embeddings-router --features ort,candle,mkl,http --no-default-features && sccache -s
 
 FROM builder AS grpc-builder
 
@@ -65,7 +68,9 @@ RUN PROTOC_ZIP=protoc-21.12-linux-x86_64.zip && \
 
 COPY proto proto
 
-RUN cargo build --release --bin text-embeddings-router -F grpc -F ort -F candle -F mkl-dynamic --no-default-features && sccache -s
+RUN --mount=type=secret,id=actions_cache_url,env=ACTIONS_CACHE_URL \
+    --mount=type=secret,id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+    cargo build --release --bin text-embeddings-router --features ort,candle,mkl,grpc --no-default-features && sccache -s
 
 FROM debian:bookworm-slim AS base
 
